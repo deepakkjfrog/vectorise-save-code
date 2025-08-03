@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: vectorize_postgres
+    environment:
+      POSTGRES_DB: vectorize_db
+      POSTGRES_USER: vectorize_user
+      POSTGRES_PASSWORD: vectorize_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vectorize_user -d vectorize_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  code-vectorizer:
+    build: .
+    container_name: vectorize_api
+    environment:
+      - DATABASE_URL=postgresql://vectorize_user:vectorize_password@postgres:5432/vectorize_db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-text-embedding-ada-002}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_USERNAME=${GITHUB_USERNAME}
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-1048576}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./logs:/app/logs
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: vectorize_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@vectorize.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data: 

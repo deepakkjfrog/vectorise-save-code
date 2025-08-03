@@ -1,0 +1,15 @@
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+python-dotenv==1.0.0
+gitpython==3.1.40
+openai>=1.0.0,<2.0.0
+tiktoken==0.5.2
+numpy==1.24.3
+pandas==2.1.4
+click==8.1.7
+rich==13.7.0
+pathlib2==2.3.7
+python-magic==0.4.27
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0 
