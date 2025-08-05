@@ -294,24 +294,39 @@ async def vectorize_repository_async(
         # Step 2: Save repository to database
         job_manager.update_job(job_id, 'processing', {'step': 'saving_repository'})
         with db_manager.get_session(schema_name) as db:
-            # First, delete any existing repositories with the same name to avoid duplicates
-            db.execute(text(f"""
-                DELETE FROM {schema_name}.repositories 
+            # Check if repository already exists
+            existing_repo = db.execute(text(f"""
+                SELECT id FROM {schema_name}.repositories 
                 WHERE repo_name = :repo_name
             """), {
                 'repo_name': repo_name
-            })
+            }).fetchone()
             
-            # Insert new repository
-            result = db.execute(text(f"""
-                INSERT INTO {schema_name}.repositories (repo_name, repo_url, clone_path, status)
-                VALUES (:repo_name, :repo_url, :clone_path, 'processing')
-                RETURNING id
-            """), {
-                'repo_name': repo_name,
-                'repo_url': str(repo_url),
-                'clone_path': clone_path
-            })
+            if existing_repo:
+                # Update existing repository
+                db.execute(text(f"""
+                    UPDATE {schema_name}.repositories 
+                    SET repo_url = :repo_url, clone_path = :clone_path, status = 'processing', updated_at = CURRENT_TIMESTAMP
+                    WHERE repo_name = :repo_name
+                """), {
+                    'repo_name': repo_name,
+                    'repo_url': str(repo_url),
+                    'clone_path': clone_path
+                })
+                repository_id = existing_repo[0]
+            else:
+                # Insert new repository
+                result = db.execute(text(f"""
+                    INSERT INTO {schema_name}.repositories (repo_name, repo_url, clone_path, status)
+                    VALUES (:repo_name, :repo_url, :clone_path, 'processing')
+                    RETURNING id
+                """), {
+                    'repo_name': repo_name,
+                    'repo_url': str(repo_url),
+                    'clone_path': clone_path
+                })
+                repository_id = result.fetchone()[0]
+            
             db.commit()
         
         # Step 3: Discover code files
@@ -359,47 +374,71 @@ async def vectorize_repository_async(
             'chunks_created': len(all_chunks)
         })
         
-        # Step 5: Save files to database
+        # Step 5: Save files to database and track changes
         with db_manager.get_session(schema_name) as db:
             file_mapping = {}
+            files_to_update = []
+            files_to_insert = []
+            
             for file_info in processed_files:
                 content_hash = git_manager.get_file_content_hash(file_info['absolute_path'])
                 
-                # Insert file
+                # Check if file exists and if content has changed
+                existing_file = db.execute(text(f"""
+                    SELECT id, content_hash FROM {schema_name}.code_files 
+                    WHERE repository_id = :repository_id AND file_path = :file_path
+                """), {
+                    'repository_id': repository_id,
+                    'file_path': file_info['file_path']
+                }).fetchone()
+                
+                if existing_file:
+                    existing_file_id, existing_hash = existing_file
+                    if existing_hash != content_hash:
+                        # File content has changed, mark for update
+                        files_to_update.append((existing_file_id, file_info, content_hash))
+                    file_mapping[file_info['file_path']] = existing_file_id
+                else:
+                    # New file, mark for insertion
+                    files_to_insert.append((file_info, content_hash))
+            
+            # Insert new files
+            for file_info, content_hash in files_to_insert:
                 result = db.execute(text(f"""
                     INSERT INTO {schema_name}.code_files 
                     (repository_id, file_path, file_name, file_extension, file_size, content_hash)
-                    VALUES (
-                        (SELECT id FROM {schema_name}.repositories WHERE repo_name = :repo_name),
-                        :file_path, :file_name, :file_extension, :file_size, :content_hash
-                    )
-                    ON CONFLICT DO NOTHING
+                    VALUES (:repository_id, :file_path, :file_name, :file_extension, :file_size, :content_hash)
                     RETURNING id
                 """), {
-                    'repo_name': repo_name,
+                    'repository_id': repository_id,
                     'file_path': file_info['file_path'],
                     'file_name': file_info['file_name'],
                     'file_extension': file_info['file_extension'],
                     'file_size': file_info['file_size'],
                     'content_hash': content_hash
                 })
-                
-                row = result.fetchone()
-                if row is None:
-                    # File already exists, get its ID
-                    result = db.execute(text(f"""
-                        SELECT id FROM {schema_name}.code_files 
-                        WHERE repository_id = (SELECT id FROM {schema_name}.repositories WHERE repo_name = :repo_name)
-                        AND file_path = :file_path
-                    """), {
-                        'repo_name': repo_name,
-                        'file_path': file_info['file_path']
-                    })
-                    file_id = result.fetchone()[0]
-                else:
-                    file_id = row[0]
-                
+                file_id = result.fetchone()[0]
                 file_mapping[file_info['file_path']] = file_id
+            
+            # Update changed files
+            for file_id, file_info, content_hash in files_to_update:
+                db.execute(text(f"""
+                    UPDATE {schema_name}.code_files 
+                    SET file_size = :file_size, content_hash = :content_hash
+                    WHERE id = :file_id
+                """), {
+                    'file_id': file_id,
+                    'file_size': file_info['file_size'],
+                    'content_hash': content_hash
+                })
+                
+                # Delete existing chunks for this file since content changed
+                db.execute(text(f"""
+                    DELETE FROM {schema_name}.code_chunks 
+                    WHERE file_id = :file_id
+                """), {
+                    'file_id': file_id
+                })
             
             db.commit()
         
@@ -418,17 +457,28 @@ async def vectorize_repository_async(
             'files_discovered': len(code_files),
             'files_processed': len(processed_files),
             'chunks_created': len(all_chunks),
-            'chunks_with_embeddings': len(processed_chunks)
+            'chunks_with_embeddings': len(processed_chunks),
+            'files_to_insert': len(files_to_insert),
+            'files_to_update': len(files_to_update)
         })
         
         # Step 7: Save chunks and embeddings
         with db_manager.get_session(schema_name) as db:
             saved_count = 0
+            
+            # Only process chunks for files that were inserted or updated
+            files_that_changed = set()
+            for file_info, _ in files_to_insert:
+                files_that_changed.add(file_info['file_path'])
+            for _, file_info, _ in files_to_update:
+                files_that_changed.add(file_info['file_path'])
+            
             for chunk in processed_chunks:
                 file_path = chunk['file_info']['file_path']
                 file_id = file_mapping.get(file_path)
                 
-                if file_id is None:
+                # Only save chunks for files that changed or are new
+                if file_id is None or file_path not in files_that_changed:
                     continue
                 
                 db.execute(text(f"""
@@ -448,7 +498,39 @@ async def vectorize_repository_async(
             
             db.commit()
         
-        # Step 8: Update repository status
+        # Step 8: Clean up files that no longer exist in the repository
+        with db_manager.get_session(schema_name) as db:
+            # Get all current file paths in the repository
+            current_file_paths = {file_info['file_path'] for file_info in processed_files}
+            
+            # Find files in database that no longer exist
+            db_files = db.execute(text(f"""
+                SELECT id, file_path FROM {schema_name}.code_files 
+                WHERE repository_id = :repository_id
+            """), {
+                'repository_id': repository_id
+            }).fetchall()
+            
+            files_to_delete = []
+            for db_file_id, db_file_path in db_files:
+                if db_file_path not in current_file_paths:
+                    files_to_delete.append(db_file_id)
+            
+            # Delete chunks and files that no longer exist
+            if files_to_delete:
+                file_ids_str = ','.join(map(str, files_to_delete))
+                db.execute(text(f"""
+                    DELETE FROM {schema_name}.code_chunks 
+                    WHERE file_id IN ({file_ids_str})
+                """))
+                db.execute(text(f"""
+                    DELETE FROM {schema_name}.code_files 
+                    WHERE id IN ({file_ids_str})
+                """))
+            
+            db.commit()
+        
+        # Step 9: Update repository status
         with db_manager.get_session(schema_name) as db:
             db.execute(text(f"""
                 UPDATE {schema_name}.repositories 
@@ -457,7 +539,7 @@ async def vectorize_repository_async(
             """), {'repo_name': repo_name})
             db.commit()
         
-        # Step 9: Cleanup
+        # Step 10: Cleanup
         git_manager.cleanup_repository(clone_path)
         
         # Update final job status
